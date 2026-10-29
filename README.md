@@ -100,6 +100,8 @@ sudo outline-chain amnezia add amnezia-awg
 sudo outline-chain status
 ```
 
+After replacing the installed `/usr/local/sbin/outline-chain` with a newer version, run `sudo systemctl restart outline-chain` so the controller runs the new code. Clients reconnect after a few seconds.
+
 Add each protocol container you use, and `amnezia-dns` if your clients use Amnezia's DNS (`172.29.172.254`); otherwise its recursive lookups exit through A.
 
 | Resource | Purpose |

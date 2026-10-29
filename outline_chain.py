@@ -722,7 +722,14 @@ def amnezia_add(cfg, args):
     name = validate_name(args.name, "container")
     if name == cfg["container"]:
         raise Error("That is the managed Outline container.")
-    original = inspect(name)
+    try:
+        original = inspect(name)
+    except DockerError as exc:
+        if exc.status != 404:
+            raise
+        found = [row["Names"][0].lstrip("/") for row in api("GET", "/containers/json?all=true")
+                 if "amnezia" in (row["Names"][0] + row["Image"]).lower()]
+        raise Error(f"No container named {name}. Amnezia containers here: {', '.join(found) or 'none'}.") from None
     if (original["Config"].get("Labels") or {}).get(LABEL) == "1":
         raise Error(f"{name} is already managed.")
     exclude = preflight_amnezia(original)
@@ -735,7 +742,9 @@ def amnezia_add(cfg, args):
     save(cfg)
     try:
         if cfg["enabled"]:
-            amnezia_chains(cfg)  # Guard the new container's bridges before it restarts.
+            # Guard the new container's bridges before it restarts. attach() also hooks the
+            # chains, which a controller started by an older version never did.
+            attach(cfg)
         ready = lambda new_id: check_gateway(cfg, name, inspect(new_id)) or True
         replace_container(cfg, original, amnezia_payload(original), name=name, kind="amnezia-add",
                           networks=extra_networks(original, ()), ready=ready)
@@ -753,7 +762,7 @@ def amnezia_add(cfg, args):
     try:
         test_amnezia(cfg, name, test_upstream(cfg))
     except Error:
-        print(f"{name} is managed, but its test failed. Its traffic is blocked, not sent directly. "
+        print(f"{name} is managed, but its test failed. Check 'outline-chain status'; "
               f"'outline-chain amnezia remove {name}' restores it.", file=sys.stderr)
         raise
     print(f"ON: {name} clients now exit through the upstream. Reconnect existing clients.")

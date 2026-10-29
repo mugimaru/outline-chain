@@ -198,6 +198,32 @@ class Amnezia(unittest.TestCase):
                 oc.amnezia_add(state, Args())
         self.assertEqual(state["amnezia"]["containers"], {})
 
+    def test_add_while_on_hooks_guards_before_replacing(self):
+        state = amn_cfg(True)
+        state["amnezia"]["containers"] = {}
+        events = []
+        class Args:
+            name = "amnezia-awg"
+            subnet = oc.AMN_SUBNET
+        with patch.object(oc, "inspect", return_value=amn_original()), patch.object(oc, "preflight_amnezia", return_value=[]), \
+             patch.object(oc, "atomic"), patch.object(oc, "save"), \
+             patch.object(oc, "attach", side_effect=lambda *a: events.append("attach")), \
+             patch.object(oc, "replace_container", side_effect=lambda *a, **k: events.append("replace")), \
+             patch.object(oc, "test_upstream", return_value="203.0.113.10"), patch.object(oc, "test_amnezia"):
+            oc.amnezia_add(state, Args())
+        self.assertEqual(events, ["attach", "replace"])
+
+    def test_unknown_name_lists_amnezia_containers(self):
+        class Args:
+            name = "amnezia-awg"
+            subnet = oc.AMN_SUBNET
+        rows = [{"Names": ["/amnezia-awg2"], "Image": "amnezia-awg2"}, {"Names": ["/hbbs"], "Image": "rustdesk"}]
+        with patch.object(oc, "inspect", side_effect=oc.DockerError("missing", 404)), \
+             patch.object(oc, "api", return_value=rows):
+            with self.assertRaises(oc.Error) as raised:
+                oc.amnezia_add(cfg(), Args())
+        self.assertIn("Amnezia containers here: amnezia-awg2.", str(raised.exception))
+
     def test_recover_settles_registration(self):
         for kind, committed, expected in [("amnezia-add", True, True), ("amnezia-add", False, None),
                                           ("amnezia-remove", True, None), ("amnezia-remove", False, True)]:
