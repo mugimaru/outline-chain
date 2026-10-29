@@ -110,7 +110,9 @@ Add each protocol container you use, and `amnezia-dns` if your clients use Amnez
 | `OC_AMN_ROUTE` (`mangle/PREROUTING`), `OC_AMN_POST` (`mangle/POSTROUTING`) | Mark, then guard, original-direction traffic from that subnet. Replies to clients' inbound VPN connections are unaffected. Traffic between the container's own Docker bridges (e.g. to `amnezia-dns`) stays local. |
 | `/etc/outline-chain/amnezia-NAME.json` | Private snapshot of the original container, used by `amnezia remove` and `uninstall`. |
 
-What stays the same: image, environment, mounts, published ports, privileges, and other Docker networks (static IPs included). What changes: restart policy `no` (the controller starts it behind the guard), Watchtower disabled for it, container DNS `1.1.1.1`.
+Amnezia keeps its keys and client list inside the container's own filesystem, not on a volume. So `add` and `remove` first commit the stopped container to an image `outline-chain/NAME:TIMESTAMP` and start the replacement from that image. They also keep the old container, stopped, as `oc-backup-ID`. Once real clients work, remove the old copies yourself with `docker rm oc-backup-ID` and `docker rmi outline-chain/NAME:TIMESTAMP`. Containers with anonymous volumes are refused.
+
+What stays the same: the container's files, environment, mounts, published ports, privileges, and other Docker networks (static IPs included). What changes: restart policy `no` (the controller starts it behind the guard), Watchtower disabled for it, container DNS `1.1.1.1`.
 
 **If the Amnezia app reinstalls or recreates a protocol**, the new container is back on Docker's default bridge. While ON, the controller **stops** it rather than letting it exit through A, and logs the reason. Run `sudo outline-chain amnezia add NAME` again. Adding users or editing a protocol's settings in the app does not recreate the container.
 

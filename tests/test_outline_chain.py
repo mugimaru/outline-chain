@@ -143,6 +143,54 @@ class Amnezia(unittest.TestCase):
         self.assertLess(events.index("/networks/amnezia-dns-net/connect"), events.index("start"))
         self.assertIn("/containers/create?name=amnezia-awg", events)
 
+    def test_snapshot_replacement_keeps_container_filesystem(self):
+        calls = []
+        def api(method, path, data=None, **kw):
+            calls.append((method, path, data))
+            if path.startswith("/commit"):
+                return {"Id": "sha256:snapshot"}
+            return {"Id": "new-container"} if path.startswith("/containers/create") else None
+        with patch.object(oc, "api", side_effect=api), patch.object(oc, "save"), \
+             patch.object(oc, "stop_container"), patch.object(oc, "start_container"), \
+             patch.object(oc, "inspect", return_value={"State": {"Running": True}}), patch("sys.stdout"):
+            oc.replace_container(amn_cfg(), amn_original(), {"Image": "sha256:awg"}, name="amnezia-awg",
+                                 ready=lambda _: True, snapshot=True)
+        paths = [c[1] for c in calls]
+        commit = next(i for i, p in enumerate(paths) if p.startswith("/commit"))
+        create = next(i for i, p in enumerate(paths) if p.startswith("/containers/create"))
+        self.assertLess(commit, create)
+        self.assertIn("container=fedcba9876543210", paths[commit])
+        self.assertEqual(calls[create][2]["Image"], "sha256:snapshot")
+        self.assertFalse(any(m == "DELETE" for m, *_ in calls))  # the old container stays as a backup
+
+    def test_add_and_remove_both_snapshot(self):
+        class Args:
+            name = "amnezia-awg"
+            subnet = oc.AMN_SUBNET
+        state = amn_cfg()
+        state["amnezia"]["containers"] = {}
+        with patch.object(oc, "inspect", return_value=amn_original()), patch.object(oc, "preflight_amnezia", return_value=[]), \
+             patch.object(oc, "atomic"), patch.object(oc, "save"), patch.object(oc, "replace_container") as replace, \
+             patch("sys.stdout"):
+            oc.amnezia_add(state, Args())
+        self.assertTrue(replace.call_args.kwargs["snapshot"])
+        with tempfile.TemporaryDirectory() as directory, patch.object(oc, "ROOT", Path(directory)), \
+             patch.object(oc, "inspect", return_value=amn_managed()), patch.object(oc, "save"), \
+             patch.object(oc, "replace_container") as replace:
+            (Path(directory) / "amnezia-amnezia-awg.json").write_text(json.dumps(amn_original()))
+            oc.restore_amnezia(amn_cfg(), "amnezia-awg")
+        self.assertTrue(replace.call_args.kwargs["snapshot"])
+
+    def test_anonymous_volume_is_refused(self):
+        item = amn_original()
+        item["Mounts"] = [{"Type": "volume", "Name": "3f2a9c", "Destination": "/data"}]
+        with patch.object(oc.shutil, "which", return_value="/usr/bin/nsenter"):
+            with self.assertRaises(oc.Error):
+                oc.preflight_amnezia(item)
+            item["HostConfig"]["Binds"] = ["3f2a9c:/data"]
+            with patch.object(oc, "network_subnets", return_value=["172.29.172.0/24"]):
+                self.assertEqual(oc.preflight_amnezia(item), ["172.29.172.0/24"])
+
     def test_default_route_outside_managed_bridge_is_refused(self):
         routes = json.dumps([{"dst": "default", "gateway": "172.29.172.1", "dev": "eth1"}])
         with patch.object(oc, "run", return_value=subprocess.CompletedProcess([], 0, routes, "")) as run:

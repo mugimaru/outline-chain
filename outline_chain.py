@@ -266,8 +266,13 @@ def outline_ready(container_id):
     return run(DOCKER + ["exec", container_id, "node", "--version"], check=False).returncode == 0
 
 
-def replace_container(cfg, original, payload, *, name=None, networks=(), ready=outline_ready, kind=None):
-    """Keep the stopped old container until the new one starts; roll back on failure."""
+def replace_container(cfg, original, payload, *, name=None, networks=(), ready=outline_ready, kind=None,
+                      snapshot=False):
+    """Keep the stopped old container until the new one starts; roll back on failure.
+
+    snapshot: the container keeps state in its own filesystem (Amnezia keys and clients), so
+    the replacement starts from a commit of it and the old container is kept, not deleted.
+    """
     name = name or cfg["container"]
     old_id = original["Id"]
     backup_name = "oc-backup-" + old_id[:12]
@@ -279,6 +284,10 @@ def replace_container(cfg, original, payload, *, name=None, networks=(), ready=o
     try:
         api("POST", cpath(old_id, "/update"), {"RestartPolicy": {"Name": "no"}})
         stop_container(old_id)
+        if snapshot:
+            query = urllib.parse.urlencode({"container": old_id, "repo": "outline-chain/" + name.lower(),
+                                            "tag": time.strftime("%Y%m%d-%H%M%S"), "pause": "false"})
+            payload = dict(payload, Image=api("POST", "/commit?" + query, {})["Id"])
         api("POST", cpath(old_id, "/rename?name=" + backup_name))
         renamed = True
         created = api("POST", "/containers/create?name=" + urllib.parse.quote(name), payload)
@@ -310,8 +319,11 @@ def replace_container(cfg, original, payload, *, name=None, networks=(), ready=o
         cfg.pop("transition", None)
         save(cfg)
         raise
-    # Do not remove volumes. Outline state remains on the original bind mounts.
-    api("DELETE", cpath(old_id))
+    if snapshot:
+        print(f"Previous container kept, stopped, as {backup_name}.", flush=True)
+    else:
+        # Do not remove volumes. Outline state remains on the original bind mounts.
+        api("DELETE", cpath(old_id))
     cfg.pop("transition", None)
     save(cfg)
 
@@ -696,6 +708,11 @@ def preflight_amnezia(item):
         raise Error("IPv6 on the container's Docker networks is unsupported; it would bypass the IPv4 tunnel.")
     if not shutil.which("nsenter"):
         raise Error("nsenter (util-linux) is required.")
+    named = {m.get("Source") for m in item["HostConfig"].get("Mounts") or []}
+    named |= {bind.split(":", 1)[0] for bind in item["HostConfig"].get("Binds") or []}
+    if any(m["Type"] == "volume" and m.get("Name") not in named for m in item.get("Mounts") or []):
+        # A recreated container would get a new, empty anonymous volume; a commit doesn't include it.
+        raise Error("Containers with anonymous volumes are unsupported; their data would not carry over.")
     exclude = set()
     for network, _ in extra_networks(item, ()):
         exclude.update(network_subnets(network))
@@ -747,7 +764,7 @@ def amnezia_add(cfg, args):
             attach(cfg)
         ready = lambda new_id: check_gateway(cfg, name, inspect(new_id)) or True
         replace_container(cfg, original, amnezia_payload(original), name=name, kind="amnezia-add",
-                          networks=extra_networks(original, ()), ready=ready)
+                          networks=extra_networks(original, ()), ready=ready, snapshot=True)
     except BaseException:
         del section["containers"][name]
         save(cfg)
@@ -784,7 +801,7 @@ def restore_amnezia(cfg, name):
         if current and (current["Config"].get("Labels") or {}).get(LABEL) == "1":
             replace_container(cfg, current, original_payload(original), name=name, kind="amnezia-remove",
                               networks=extra_networks(original, (primary_network(original),)),
-                              ready=lambda _: True)
+                              ready=lambda _: True, snapshot=True)
         else:
             print(f"{name} is not managed by this script; its Docker configuration was left intact.")
     except BaseException:
