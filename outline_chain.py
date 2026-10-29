@@ -51,7 +51,13 @@ TABLE = 20877
 MARK = "0x4f430001"
 MARK_RULE = 20876
 PROBE_RULE = 20877
-CHAINS = ("OC_ROUTE", "OC_POST", "OC_V6")
+AMN_CHAINS = ("OC_AMN_ROUTE", "OC_AMN_POST")
+CHAINS = ("OC_ROUTE", "OC_POST", "OC_V6") + AMN_CHAINS
+# Bridge-networked Amnezia containers forward client traffic, so it is selected by a dedicated subnet.
+# The name sorts before Amnezia's own networks: older Docker picks the default gateway by network name.
+AMN_NET = "aa-outline-chain"
+AMN_BRIDGE = "ocamn0"
+AMN_SUBNET = "172.31.250.0/24"
 TUN_VERSION = "2.7.0"
 RELEASES = {
     "x86_64": ("amd64", "a612baa287a3b6de6221f74fd02b442a50888508227ecf51e1288a5ccbb77381"),
@@ -256,12 +262,16 @@ def managed_payload(original):
     return result
 
 
-def replace_container(cfg, original, payload):
+def outline_ready(container_id):
+    return run(DOCKER + ["exec", container_id, "node", "--version"], check=False).returncode == 0
+
+
+def replace_container(cfg, original, payload, *, name=None, networks=(), ready=outline_ready, kind=None):
     """Keep the stopped old container until the new one starts; roll back on failure."""
-    name = cfg["container"]
+    name = name or cfg["container"]
     old_id = original["Id"]
     backup_name = "oc-backup-" + old_id[:12]
-    cfg["transition"] = {"old_id": old_id, "backup_name": backup_name,
+    cfg["transition"] = {"old_id": old_id, "backup_name": backup_name, "name": name, "kind": kind,
                          "restart": original["HostConfig"]["RestartPolicy"], "new_id": None}
     save(cfg)
     renamed = False
@@ -275,16 +285,20 @@ def replace_container(cfg, original, payload):
         new_id = created["Id"]
         cfg["transition"]["new_id"] = new_id
         save(cfg)
+        # Docker creates a container on one network; attach the others before it starts.
+        for network, endpoint in networks:
+            api("POST", "/networks/" + urllib.parse.quote(network, safe="") + "/connect",
+                {"Container": new_id, "EndpointConfig": endpoint})
         start_container(new_id)
         for _ in range(20):
             status = inspect(new_id)["State"]
             if not status["Running"]:
-                raise Error("The replacement Outline container exited during startup.")
-            if run(DOCKER + ["exec", new_id, "node", "--version"], check=False).returncode == 0:
+                raise Error(f"The replacement {name} container exited during startup.")
+            if ready(new_id):
                 break
             time.sleep(0.5)
         else:
-            raise Error("The replacement Outline container did not become ready.")
+            raise Error(f"The replacement {name} container did not become ready.")
     except BaseException:
         if new_id:
             api("DELETE", cpath(new_id, "?force=true"))
@@ -328,9 +342,35 @@ def table_rules(cfg):
     ]
 
 
+def amnezia_rules(cfg):
+    """Forwarded traffic from registered bridge containers, selected by their stable subnet."""
+    section = cfg.get("amnezia") or {}
+    if not section.get("containers"):
+        return []
+    subnet = section["subnet"]
+    # Container-to-container and Docker DNS traffic stays on its bridges.
+    bridges = sorted({subnet, *(net for item in section["containers"].values() for net in item["exclude"])})
+    common = ["-s", subnet, "-m", "conntrack", "--ctdir", "ORIGINAL", "-m", "addrtype", "!", "--dst-type", "LOCAL"]
+    rules = [("iptables", "mangle", chain, ["-d", net, "-j", "RETURN"]) for chain in AMN_CHAINS for net in bridges]
+    # Replies to clients' inbound VPN connections are REPLY direction and keep their normal route.
+    rules.append(("iptables", "mangle", "OC_AMN_ROUTE", ["-i", AMN_BRIDGE] + common + ["-j", "MARK", "--set-mark", MARK]))
+    # mangle/POSTROUTING runs before Docker's SNAT, so the container source is still visible here.
+    rules.append(("iptables", "mangle", "OC_AMN_POST", common + ["!", "-o", TUN, "-j", "DROP"]))
+    return rules
+
+
+def amnezia_chains(cfg):
+    # One iptables-restore transaction replaces both chains, so a refresh never opens a gap.
+    lines = ["*mangle"] + [f":{chain} - [0:0]" for chain in AMN_CHAINS]
+    lines += [" ".join(["-A", chain] + rule) for _, _, chain, rule in amnezia_rules(cfg)]
+    run(["iptables-restore", "-w", "5", "--noflush"], input="\n".join(lines + ["COMMIT", ""]))
+
+
 HOOKS = [("iptables", "mangle", "OUTPUT", "OC_ROUTE"),
          ("iptables", "mangle", "POSTROUTING", "OC_POST"),
-         ("ip6tables", "filter", "OUTPUT", "OC_V6")]
+         ("ip6tables", "filter", "OUTPUT", "OC_V6"),
+         ("iptables", "mangle", "PREROUTING", "OC_AMN_ROUTE"),
+         ("iptables", "mangle", "POSTROUTING", "OC_AMN_POST")]
 
 
 def ensure_rule(tool, table, chain, rule, *, insert=False):
@@ -388,8 +428,9 @@ def attach(cfg):
         if run([tool, "-w", "5", "-t", table, "-S", chain], check=False).returncode:
             run([tool, "-w", "5", "-t", table, "-N", chain])
         ensure_rule(tool, table, chain, rule)
+    amnezia_chains(cfg)
     # Install guards first; then redirect new outbound packets.
-    for tool, table, hook, chain in [HOOKS[1], HOOKS[2], HOOKS[0]]:
+    for tool, table, hook, chain in [HOOKS[1], HOOKS[2], HOOKS[4], HOOKS[3], HOOKS[0]]:
         ensure_rule(tool, table, hook, ["-j", chain], insert=True)
 
 
@@ -428,6 +469,20 @@ def trace_ip(body):
         raise Error("The trace did not return an IPv4 address.") from None
 
 
+def trace_curl(*extra):
+    return ["curl", "--noproxy", "*", "-4", "--silent", "--show-error", "--fail", *extra,
+            "--connect-timeout", "8", "--max-time", "20", "--resolve", "one.one.one.one:443:1.1.1.1",
+            "https://one.one.one.one/cdn-cgi/trace"]
+
+
+def dig_query(*extra):
+    return ["dig", "-4", *extra, "@1.1.1.1", "example.com", "A", "+notcp", "+ignore", "+time=4", "+tries=1"]
+
+
+def dns_ok(answer):
+    return "status: NOERROR" in answer and "(UDP)" in answer and bool(re.search(r"ANSWER: [1-9]", answer))
+
+
 def probe(cfg, *, container=False):
     if container:
         js = '''const https=require("https");
@@ -438,10 +493,7 @@ const timer=setTimeout(()=>{req.destroy(new Error("request timeout"));},20000);
 req.on("error",e=>{clearTimeout(timer);console.error(e.message);process.exitCode=1;});'''
         body = docker_exec(cfg, ["node", "-e", js], timeout=30).stdout
     else:
-        body = run(["curl", "--noproxy", "*", "-4", "--silent", "--show-error", "--fail",
-                    "--interface", cfg["probe"], "--connect-timeout", "8", "--max-time", "20",
-                    "--resolve", "one.one.one.one:443:1.1.1.1",
-                    "https://one.one.one.one/cdn-cgi/trace"], timeout=25).stdout
+        body = run(trace_curl("--interface", cfg["probe"]), timeout=25).stdout
     actual = trace_ip(body)
     expected = cfg.get("expected_exit")
     if expected and actual != expected:
@@ -451,9 +503,8 @@ req.on("error",e=>{clearTimeout(timer);console.error(e.message);process.exitCode
 
 def test_upstream(cfg):
     address = probe(cfg)
-    answer = run(["dig", "-4", "-b", cfg["probe"], "@1.1.1.1", "example.com", "A",
-                  "+notcp", "+ignore", "+time=4", "+tries=1"], timeout=10).stdout
-    if "status: NOERROR" not in answer or "(UDP)" not in answer or not re.search(r"ANSWER: [1-9]", answer):
+    answer = run(dig_query("-b", cfg["probe"]), timeout=10).stdout
+    if not dns_ok(answer):
         raise Error("UDP DNS through B failed; check B's UDP port and access key.")
     print(f"PASS: upstream HTTPS exit {address}; UDP DNS answered.", flush=True)
     return address
@@ -479,6 +530,273 @@ else console.log("UDP_DNS_OK");});s.send(q,53,"1.1.1.1");'''
     return actual
 
 
+def amnezia_names(cfg, *, ready_only=True):
+    items = (cfg.get("amnezia") or {}).get("containers", {})
+    return [name for name, item in items.items() if item.get("ready") or not ready_only]
+
+
+def amnezia_backup(name):
+    return ROOT / f"amnezia-{name}.json"
+
+
+def primary_network(item):
+    mode = item["HostConfig"].get("NetworkMode") or "default"
+    return "bridge" if mode == "default" else mode
+
+
+def endpoint(item, network):
+    """Static IPs and aliases to reuse, without Docker's generated short-ID alias."""
+    settings = item["NetworkSettings"]["Networks"][network]
+    result = {key: settings[key] for key in ("IPAMConfig", "DriverOpts") if settings.get(key)}
+    aliases = [alias for alias in settings.get("Aliases") or [] if alias != item["Id"][:12]]
+    if aliases:
+        result["Aliases"] = aliases
+    return result
+
+
+def extra_networks(item, skip):
+    # The default bridge accepts no aliases/static IPs and is replaced by the managed bridge.
+    return [(network, endpoint(item, network)) for network in item["NetworkSettings"]["Networks"]
+            if network not in (*skip, "bridge", AMN_NET)]
+
+
+def network_subnets(name):
+    net = api("GET", "/networks/" + urllib.parse.quote(name, safe=""))
+    if net.get("Driver") != "bridge":
+        raise Error(f"Docker network {name} is not a bridge network.")
+    return [row["Subnet"] for row in (net.get("IPAM") or {}).get("Config") or [] if ":" not in row.get("Subnet", ":")]
+
+
+def amnezia_network(subnet=None):
+    """Return the managed bridge's subnet and gateway, creating it on first use."""
+    path = "/networks/" + AMN_NET
+    try:
+        net = api("GET", path)
+    except DockerError as exc:
+        if exc.status != 404 or not subnet:
+            raise
+        network = ipaddress.IPv4Network(subnet)
+        api("POST", "/networks/create", {"Name": AMN_NET, "Driver": "bridge", "CheckDuplicate": True,
+                                         "EnableIPv6": False, "Labels": {LABEL: "1"},
+                                         "IPAM": {"Config": [{"Subnet": str(network), "Gateway": str(network[1])}]},
+                                         "Options": {"com.docker.network.bridge.name": AMN_BRIDGE}})
+        net = api("GET", path)
+    config = (net.get("IPAM") or {}).get("Config") or []
+    if ((net.get("Labels") or {}).get(LABEL) != "1" or net.get("EnableIPv6") or len(config) != 1 or
+            (net.get("Options") or {}).get("com.docker.network.bridge.name") != AMN_BRIDGE):
+        raise Error(f"Docker network {AMN_NET} exists but was not created by this tool.")
+    return config[0]["Subnet"], config[0]["Gateway"]
+
+
+def amnezia_payload(original):
+    result = copy.deepcopy(original["Config"])
+    result["Image"] = original["Image"]
+    result["Labels"] = dict(result.get("Labels") or {})
+    result["Labels"][LABEL] = "1"
+    result["Labels"]["com.centurylinklabs.watchtower.enable"] = "false"
+    host = copy.deepcopy(original["HostConfig"])
+    host["NetworkMode"] = AMN_NET
+    # The controller starts it only after its routing guard exists.
+    host["RestartPolicy"] = {"Name": "no", "MaximumRetryCount": 0}
+    # Docker's embedded DNS forwards to this from the container namespace, so it follows the tunnel.
+    host["Dns"] = ["1.1.1.1"]
+    host["DnsSearch"] = []
+    host["DnsOptions"] = []
+    result["HostConfig"] = host
+    result["NetworkingConfig"] = {"EndpointsConfig": {AMN_NET: {"GwPriority": 1000}}}
+    return result
+
+
+def original_payload(original):
+    payload = copy.deepcopy(original["Config"])
+    # Restore the original tag too, so Watchtower can resume normal image updates.
+    payload["HostConfig"] = copy.deepcopy(original["HostConfig"])
+    primary = primary_network(original)
+    # Outline uses host networking; only a user-defined primary network carries endpoint settings.
+    if primary not in ("bridge", "host", "none") and primary in original["NetworkSettings"]["Networks"]:
+        payload["NetworkingConfig"] = {"EndpointsConfig": {primary: endpoint(original, primary)}}
+    return payload
+
+
+def amnezia_managed(item):
+    labels = item["Config"].get("Labels") or {}
+    return (labels.get(LABEL) == "1" and labels.get("com.centurylinklabs.watchtower.enable") == "false" and
+            item["HostConfig"]["RestartPolicy"]["Name"] == "no" and item["HostConfig"].get("NetworkMode") == AMN_NET and
+            AMN_NET in (item["NetworkSettings"].get("Networks") or {}))
+
+
+def netns(item):
+    return ["nsenter", "-t", str(item["State"]["Pid"]), "-n"]
+
+
+def check_gateway(cfg, name, item):
+    # The guard matches the managed subnet; a default route via another network would bypass it.
+    rows = json.loads(run(netns(item) + ["ip", "-j", "-4", "route", "show", "default"]).stdout or "[]")
+    if {row.get("gateway") for row in rows} != {cfg["amnezia"]["gateway"]}:
+        raise Error(f"{name}'s default route does not use {AMN_NET}; refusing to run it unprotected.")
+
+
+def test_amnezia(cfg, name, upstream):
+    item = inspect(name)
+    if not amnezia_managed(item) or not item["State"]["Running"]:
+        raise Error(f"{name} is not running with managed settings; run 'outline-chain amnezia add {name}'.")
+    check_gateway(cfg, name, item)
+    # Host curl/dig inside the container's network namespace take the same forwarded path as its clients.
+    actual = trace_ip(run(netns(item) + trace_curl(), timeout=25).stdout)
+    if actual != upstream:
+        raise Error(f"{name} exits via {actual}, but the tested upstream exits via {upstream}.")
+    if not dns_ok(run(netns(item) + dig_query(), timeout=10).stdout):
+        raise Error(f"{name} UDP DNS failed.")
+    print(f"PASS: {name} HTTPS exit {actual}; UDP DNS answered.", flush=True)
+
+
+def test_amnezia_all(cfg, upstream):
+    for name in amnezia_names(cfg):
+        test_amnezia(cfg, name, upstream)
+
+
+def supervise_amnezia(cfg, seen):
+    """Keep registered Amnezia containers running only behind the managed bridge."""
+    state = {}
+    for name in amnezia_names(cfg):
+        try:
+            item = inspect(name)
+            if not amnezia_managed(item):
+                raise Error(f"{name} lost its managed network settings (recreated from the Amnezia app?). "
+                            f"Run 'outline-chain amnezia add {name}'.")
+            if not item["State"]["Running"]:
+                start_container(name)
+                item = inspect(name)
+            state[name] = f"{item['Id']}:{item['State']['Pid']}"
+            if state[name] != seen.get(name):
+                check_gateway(cfg, name, item)
+        except Error as exc:
+            state[name] = str(exc)
+            if seen.get(name) != state[name]:
+                print("ERROR: " + scrub(exc), file=sys.stderr, flush=True)
+            if cfg["enabled"]:
+                # Fail closed: an unrecognized network layout may not be covered by the guard.
+                try:
+                    stop_container(name)
+                except Error:
+                    pass
+    return state
+
+
+def preflight_amnezia(item):
+    mode = item["HostConfig"].get("NetworkMode") or "default"
+    networks = item["NetworkSettings"].get("Networks") or {}
+    if mode in ("host", "none") or mode.startswith("container:") or primary_network(item) not in networks:
+        raise Error("Only bridge-networked Amnezia containers are supported.")
+    if "outline/shadowbox" in item["Config"]["Image"]:
+        raise Error("Outline is managed by setup, not as an Amnezia container.")
+    if item["HostConfig"].get("AutoRemove") or item["HostConfig"].get("Links"):
+        raise Error("AutoRemove and legacy --link containers are unsupported.")
+    if any(settings.get("GlobalIPv6Address") for settings in networks.values()):
+        raise Error("IPv6 on the container's Docker networks is unsupported; it would bypass the IPv4 tunnel.")
+    if not shutil.which("nsenter"):
+        raise Error("nsenter (util-linux) is required.")
+    exclude = set()
+    for network, _ in extra_networks(item, ()):
+        exclude.update(network_subnets(network))
+    return sorted(exclude)
+
+
+def check_subnet(cfg, value):
+    network = ipaddress.IPv4Network(value)
+    if not network.is_private or network.prefixlen > 28:
+        raise Error("The Amnezia subnet must be a private IPv4 network of /28 or larger.")
+    if ipaddress.IPv4Address(cfg["probe"]) in network:
+        raise Error("The Amnezia subnet contains the probe address.")
+    routes = json.loads(run(["ip", "-j", "-4", "route", "show", "table", "all"]).stdout)
+    for route in routes:
+        dest = route.get("dst", "default")
+        if dest != "default" and network.overlaps(ipaddress.ip_network(dest, strict=False)):
+            raise Error("The Amnezia subnet overlaps an existing route; choose --subnet.")
+    return str(network)
+
+
+def amnezia_add(cfg, args):
+    if cfg.get("transition") or not cfg.get("ready"):
+        raise Error("Installation is incomplete; recover/uninstall first.")
+    name = validate_name(args.name, "container")
+    if name == cfg["container"]:
+        raise Error("That is the managed Outline container.")
+    original = inspect(name)
+    if (original["Config"].get("Labels") or {}).get(LABEL) == "1":
+        raise Error(f"{name} is already managed.")
+    exclude = preflight_amnezia(original)
+    section = cfg.setdefault("amnezia", {"subnet": None, "gateway": None, "containers": {}})
+    if not section["subnet"]:
+        section["subnet"], section["gateway"] = amnezia_network(check_subnet(cfg, args.subnet))
+    # Not ready yet: the controller ignores it until the replacement has committed.
+    section["containers"][name] = {"exclude": exclude, "ready": False}
+    atomic(amnezia_backup(name), json.dumps(original, indent=2) + "\n")
+    save(cfg)
+    try:
+        if cfg["enabled"]:
+            amnezia_chains(cfg)  # Guard the new container's bridges before it restarts.
+        ready = lambda new_id: check_gateway(cfg, name, inspect(new_id)) or True
+        replace_container(cfg, original, amnezia_payload(original), name=name, kind="amnezia-add",
+                          networks=extra_networks(original, ()), ready=ready)
+    except BaseException:
+        del section["containers"][name]
+        save(cfg)
+        if cfg["enabled"]:
+            amnezia_chains(cfg)
+        raise
+    section["containers"][name]["ready"] = True
+    save(cfg)
+    if not cfg["enabled"]:
+        print(f"{name} is managed. Chaining is OFF; its clients exit directly through A until 'outline-chain on'.")
+        return
+    try:
+        test_amnezia(cfg, name, test_upstream(cfg))
+    except Error:
+        print(f"{name} is managed, but its test failed. Its traffic is blocked, not sent directly. "
+              f"'outline-chain amnezia remove {name}' restores it.", file=sys.stderr)
+        raise
+    print(f"ON: {name} clients now exit through the upstream. Reconnect existing clients.")
+
+
+def restore_amnezia(cfg, name):
+    """Recreate the original container from its backup and forget it."""
+    entry = cfg["amnezia"]["containers"][name]
+    entry["ready"] = False
+    save(cfg)
+    original = json.loads(amnezia_backup(name).read_text())
+    try:
+        current = inspect(name)
+    except DockerError as exc:
+        if exc.status != 404:
+            raise
+        current = None
+    try:
+        if current and (current["Config"].get("Labels") or {}).get(LABEL) == "1":
+            replace_container(cfg, current, original_payload(original), name=name, kind="amnezia-remove",
+                              networks=extra_networks(original, (primary_network(original),)),
+                              ready=lambda _: True)
+        else:
+            print(f"{name} is not managed by this script; its Docker configuration was left intact.")
+    except BaseException:
+        entry["ready"] = True
+        save(cfg)
+        raise
+    del cfg["amnezia"]["containers"][name]
+    save(cfg)
+
+
+def amnezia_remove(cfg, args):
+    if cfg.get("transition"):
+        raise Error("Run recover first.")
+    if args.name not in amnezia_names(cfg, ready_only=False):
+        raise Error(f"{args.name} is not registered.")
+    restore_amnezia(cfg, args.name)
+    if cfg["enabled"]:
+        amnezia_chains(cfg)
+    print(f"{args.name} restored to its original Docker settings; its clients exit directly through A.")
+
+
 def test_command(cfg):
     temporary = not cfg["enabled"]
     try:
@@ -486,6 +804,7 @@ def test_command(cfg):
         upstream = test_upstream(cfg)
         if cfg["enabled"]:
             test_container(cfg, upstream)
+            test_amnezia_all(cfg, upstream)
         else:
             print("Chaining is OFF. Only the independent upstream was tested.")
         print("Also verify a real client connected to A; this test does not perform its inbound SS handshake.")
@@ -561,6 +880,7 @@ def serve():
         start_container(cfg["container"])
         set_dns(cfg, cfg["enabled"])
         last_id = item["Id"]
+        amnezia = supervise_amnezia(cfg, {})
         notify_ready()
         while not stopped.wait(3):
             cfg = load()
@@ -572,9 +892,15 @@ def serve():
                 start_container(cfg["container"])
                 set_dns(cfg, cfg["enabled"])
                 last_id = item["Id"]
+            amnezia = supervise_amnezia(cfg, amnezia)
     finally:
         # Stop Outline BEFORE removing protection, including when Docker restarts.
         stop_container(cfg["container"])
+        for name in amnezia_names(cfg):
+            try:
+                stop_container(name)
+            except Error:
+                pass
         detach(cfg)
         stop_tunnel(cfg)
 
@@ -749,6 +1075,7 @@ def toggle(cfg, enabled):
         set_dns(cfg, True)
         attach(cfg)
         actual = test_container(cfg, upstream)
+        test_amnezia_all(cfg, upstream)
         cfg["enabled"] = True
         save(cfg)
     except BaseException:
@@ -781,6 +1108,7 @@ def set_target(cfg, args):
         upstream = test_upstream(cfg)
         if cfg["enabled"]:
             test_container(cfg, upstream)
+            test_amnezia_all(cfg, upstream)
         if not TARGET_JOURNAL.exists() or PROXY.read_text() != candidate_proxy:
             raise Error("The controller restarted during the update; the update must be retried.")
         save(cfg)
@@ -810,7 +1138,14 @@ def status(cfg):
         print(f"Container running: {item['State']['Running']}; managed settings intact: {expected_managed(item)}")
     except Error as exc:
         print(str(exc))
-    for tool, table, chain, _ in table_rules(cfg):
+    for name in amnezia_names(cfg, ready_only=False):
+        try:
+            item = inspect(name)
+            print(f"Amnezia {name}: running {item['State']['Running']}; managed settings intact: {amnezia_managed(item)}")
+        except Error as exc:
+            print(f"Amnezia {name}: {exc}")
+    chains = dict.fromkeys((tool, table, chain) for tool, table, chain, _ in table_rules(cfg) + amnezia_rules(cfg))
+    for tool, table, chain in chains:
         result = run([tool, "-t", table, "-vnL", chain], check=False)
         if result.returncode == 0:
             print(result.stdout.rstrip())
@@ -832,25 +1167,29 @@ def recover(cfg):
     transition = cfg.get("transition")
     if not transition:
         raise Error("No interrupted container replacement is recorded.")
-    # Do not stop the controller here: setup/replacement doesn't run it during transitions.
+    # Do not stop the controller here: setup/replacement doesn't run it during transitions,
+    # and it ignores Amnezia containers that are not marked ready.
     old_id = transition["old_id"]
+    name = transition.get("name", cfg["container"])
+    kind = transition.get("kind")
     try:
         old = inspect(old_id)
     except DockerError as exc:
         if exc.status != 404 or not transition.get("new_id"):
             raise
         item = inspect(transition["new_id"])
-        if item["Name"].lstrip("/") != cfg["container"]:
+        if item["Name"].lstrip("/") != name:
             raise Error("Recovery name mismatch; no containers were changed.")
         # The replacement committed, but the process died before clearing its journal.
         cfg.pop("transition", None)
+        settle_amnezia(cfg, name, kind, committed=True)
         save(cfg)
-        print("Completed the replacement journal. Run uninstall to restore the original installation.")
+        print("Completed the replacement journal. Run status to check it.")
         return
     new_id = transition.get("new_id")
     if not new_id and old["Name"].lstrip("/") == transition["backup_name"]:
         try:
-            candidate = inspect(cfg["container"])
+            candidate = inspect(name)
             if (candidate["Config"].get("Labels") or {}).get(LABEL) != "1":
                 raise Error("An unrecognized container occupies the original name. No containers were deleted.")
             new_id = candidate["Id"]
@@ -859,13 +1198,27 @@ def recover(cfg):
                 raise
     if new_id:
         api("DELETE", cpath(new_id, "?force=true"), allowed=(204, 404))
-    if old["Name"].lstrip("/") != cfg["container"]:
-        api("POST", cpath(old_id, "/rename?name=" + urllib.parse.quote(cfg["container"])))
+    if old["Name"].lstrip("/") != name:
+        api("POST", cpath(old_id, "/rename?name=" + urllib.parse.quote(name)))
     api("POST", cpath(old_id, "/update"), {"RestartPolicy": transition["restart"]})
     start_container(old_id)
     cfg.pop("transition", None)
+    settle_amnezia(cfg, name, kind, committed=False)
     save(cfg)
-    print("Original container recovered. Run uninstall to finish cleanup, then setup again if desired.")
+    if kind:
+        print(f"{name} returned to its state before the interrupted change. Run status to check it.")
+    else:
+        print("Original container recovered. Run uninstall to finish cleanup, then setup again if desired.")
+
+
+def settle_amnezia(cfg, name, kind, *, committed):
+    # The container is managed after a committed add or a rolled-back remove.
+    if kind not in ("amnezia-add", "amnezia-remove"):
+        return
+    if committed == (kind == "amnezia-add"):
+        cfg["amnezia"]["containers"][name]["ready"] = True
+    else:
+        cfg["amnezia"]["containers"].pop(name, None)
 
 
 def uninstall(cfg):
@@ -876,14 +1229,17 @@ def uninstall(cfg):
     detach(cfg)
     stop_tunnel(cfg)
     if (current["Config"].get("Labels") or {}).get(LABEL) == "1":
-        original = json.loads(BACKUP.read_text())
-        payload = copy.deepcopy(original["Config"])
-        # Restore the original tag too, so Watchtower can resume normal image updates.
-        payload["HostConfig"] = copy.deepcopy(original["HostConfig"])
-        replace_container(cfg, current, payload)
+        replace_container(cfg, current, original_payload(json.loads(BACKUP.read_text())))
         docker_exec(cfg, ["sh", "-c", "cat > /etc/resolv.conf"], input=RESOLV.read_text())
     else:
         print("Container is not managed by this script; its Docker configuration was left intact.")
+    for name in amnezia_names(cfg, ready_only=False):
+        restore_amnezia(cfg, name)
+    if cfg.get("amnezia"):
+        try:
+            api("DELETE", "/networks/" + AMN_NET, allowed=(204, 404))
+        except Error as exc:
+            print(f"Docker network {AMN_NET} was left in place: {exc}")
     for name in unit_texts():
         (UNITS / name).unlink(missing_ok=True)
     run(["systemctl", "stop", SLICE], check=False)
@@ -916,10 +1272,16 @@ def parser():
                             ("uninstall", "restore original Docker settings and remove this tool"),
                             ("recover", "recover an interrupted container replacement")]:
         sub.add_parser(name, help=help_text)
+    amnezia = sub.add_parser("amnezia", help="also chain bridge-networked Amnezia VPN containers on A")
+    actions = amnezia.add_subparsers(dest="action", required=True)
+    add = actions.add_parser("add", help="recreate a container (e.g. amnezia-awg) on the managed bridge")
+    add.add_argument("name")
+    add.add_argument("--subnet", default=AMN_SUBNET, help="IPv4 subnet of the managed Docker bridge (first add only)")
+    actions.add_parser("remove", help="restore a container's original Docker settings").add_argument("name")
     # Internal entry points are accepted but intentionally absent from public help.
     for name in ("_serve", "_tun-up"):
         sub.add_parser(name)
-    sub.metavar = "{setup,on,off,test,status,set-target,uninstall,recover}"
+    sub.metavar = "{setup,on,off,test,status,set-target,amnezia,uninstall,recover}"
     return result
 
 
@@ -941,6 +1303,8 @@ def dispatch(args):
         return test_command(cfg)
     if args.command == "set-target":
         return set_target(cfg, args)
+    if args.command == "amnezia":
+        return amnezia_add(cfg, args) if args.action == "add" else amnezia_remove(cfg, args)
     if args.command == "status":
         return status(cfg)
     if args.command == "uninstall":

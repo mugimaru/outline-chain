@@ -3,7 +3,9 @@
 A standalone Python tool for this topology:
 
 ```text
-Outline client → Outline on A → tun2socks on A → Outline on B → Internet
+Outline client  → Outline on A          ┐
+                                        ├→ tun2socks on A → Outline on B → Internet
+Amnezia client  → Amnezia container on A┘   (optional, see "Amnezia containers on A")
 ```
 
 Run the tool **on A only**. B keeps its normal Outline installation; its access-key port must accept TCP and UDP from A.
@@ -40,6 +42,8 @@ Replace the example exit IP with B's actual public exit address. If omitted, tes
 | `sudo outline-chain test` | Test upstream HTTPS and UDP DNS; when ON, also test both from inside the Outline container. |
 | `sudo outline-chain status` | Show desired mode, actual service state, target endpoint, container configuration checks, and firewall counters. |
 | `sudo outline-chain set-target` | Prompt for another B key, test it, and retain the existing ON/OFF mode. |
+| `sudo outline-chain amnezia add NAME` | Move an Amnezia container on A (e.g. `amnezia-awg`) onto the managed bridge so its clients follow the same ON/OFF mode. |
+| `sudo outline-chain amnezia remove NAME` | Restore that container's original Docker settings; its clients exit directly through A. |
 | `sudo outline-chain uninstall` | Restore original container settings, remove the controller and its network rules, and retain private backups. |
 | `sudo outline-chain recover` | Recover a recorded interrupted container replacement or target update. |
 
@@ -82,9 +86,33 @@ sudo outline-chain set-target --key-file /secure/path/new-b-key.txt
 - Plain Shadowsocks `ss://` keys using `chacha20-ietf-poly1305`, `aes-128-gcm`, or `aes-256-gcm`.
 - IPv4 upstream endpoints. Hostnames are resolved to an IPv4 address at setup/update time and pinned. Re-run `set-target` if that address changes.
 
-Dynamic `ssconf://` keys, WebSocket transports, prefix/plugin extensions, IPv6 upstream endpoints, rootless Docker, Docker bridge networking, and custom container/storage layouts are not supported by this version.
+Dynamic `ssconf://` keys, WebSocket transports, prefix/plugin extensions, IPv6 upstream endpoints, rootless Docker, bridge networking for the Outline container itself, and custom container/storage layouts are not supported by this version.
 
 While ON, non-local outbound IPv6 from Outline is blocked. IPv4 and TCP/UDP chaining are supported. Other host services keep their own routing and DNS.
+
+## Amnezia containers on A
+
+Amnezia's self-hosted server runs each protocol (AmneziaWG, XRay, OpenVPN/Cloak, …) as a bridge-networked Docker container. Their client traffic is *forwarded* by A, not sent from a host-network process, so the Outline cgroup rule cannot see it. Each added container is recreated on a dedicated Docker bridge instead:
+
+```bash
+sudo docker ps --format '{{.Names}}' | grep amnezia
+sudo outline-chain amnezia add amnezia-awg
+sudo outline-chain status
+```
+
+Add each protocol container you use, and `amnezia-dns` if your clients use Amnezia's DNS (`172.29.172.254`); otherwise its recursive lookups exit through A.
+
+| Resource | Purpose |
+| --- | --- |
+| Docker network `aa-outline-chain`, bridge `ocamn0`, `172.31.250.0/24` | Becomes the container's primary network and default route. Change the subnet with `--subnet` on the first `add`. Its name sorts before Amnezia's networks because older Docker picks the gateway network by name; every start is still checked. |
+| `OC_AMN_ROUTE` (`mangle/PREROUTING`), `OC_AMN_POST` (`mangle/POSTROUTING`) | Mark, then guard, original-direction traffic from that subnet. Replies to clients' inbound VPN connections are unaffected. Traffic between the container's own Docker bridges (e.g. to `amnezia-dns`) stays local. |
+| `/etc/outline-chain/amnezia-NAME.json` | Private snapshot of the original container, used by `amnezia remove` and `uninstall`. |
+
+What stays the same: image, environment, mounts, published ports, privileges, and other Docker networks (static IPs included). What changes: restart policy `no` (the controller starts it behind the guard), Watchtower disabled for it, container DNS `1.1.1.1`.
+
+**If the Amnezia app reinstalls or recreates a protocol**, the new container is back on Docker's default bridge. While ON, the controller **stops** it rather than letting it exit through A, and logs the reason. Run `sudo outline-chain amnezia add NAME` again. Adding users or editing a protocol's settings in the app does not recreate the container.
+
+Tests run the host's `curl` and `dig` inside each container's network namespace (`nsenter`), so they follow the same forwarded path as its clients. Docker networks with IPv6 enabled are refused.
 
 ## Persistence and container updates
 
@@ -164,9 +192,9 @@ Before relying on a new deployment, verify the client after a reboot and confirm
 
 ## Validation included with this package
 
-The manual routing design was verified on the Ubuntu 22.04 pair in the conversation. The packaged installer has **25 automated regression tests**, covering key formats/redaction, the POSTROUTING guard, preservation of container configuration, rollback, interrupted key updates, file permissions, and boot/shutdown ordering.
+The manual routing design was verified on the Ubuntu 22.04 pair in the conversation. The packaged installer has **40 automated regression tests**, covering key formats/redaction, the POSTROUTING guards, preservation of container configuration, rollback, interrupted key updates, file permissions, boot/shutdown ordering, and Amnezia container routing, supervision, and recovery.
 
-The complete installer has **not** been executed on a fresh Ubuntu VM in this workspace. The tests use mocked Docker/systemd/network operations; they do not replace a real installation/reboot test.
+The complete installer, including the Amnezia path, has **not** been executed on a fresh Ubuntu VM in this workspace. The tests use mocked Docker/systemd/network operations; they do not replace a real installation/reboot test.
 
 ```bash
 python3 -m unittest discover -s tests -v

@@ -31,6 +31,183 @@ def original():
             "State": {"Running": True}}
 
 
+def amn_cfg(enabled=False, ready=True):
+    state = cfg(enabled)
+    state["amnezia"] = {"subnet": "172.31.250.0/24", "gateway": "172.31.250.1",
+                        "containers": {"amnezia-awg": {"exclude": ["172.29.172.0/24"], "ready": ready}}}
+    return state
+
+
+def amn_original():
+    return {"Id": "fedcba9876543210", "Name": "/amnezia-awg", "Image": "sha256:awg",
+            "Config": {"Image": "amnezia-awg", "Env": ["AWG=1"], "Labels": {}},
+            "HostConfig": {"NetworkMode": "default", "RestartPolicy": {"Name": "always"}, "Privileged": True,
+                           "PortBindings": {"51820/udp": [{"HostPort": "51820"}]}},
+            "NetworkSettings": {"Networks": {
+                "bridge": {"IPAddress": "172.17.0.2"},
+                "amnezia-dns-net": {"IPAMConfig": {"IPv4Address": "172.29.172.2"},
+                                    "Aliases": ["fedcba987654", "awg"]}}},
+            "State": {"Running": True, "Pid": 4242}}
+
+
+def amn_managed():
+    item = amn_original()
+    payload = oc.amnezia_payload(item)
+    item["Config"]["Labels"] = payload["Labels"]
+    item["HostConfig"] = payload["HostConfig"]
+    item["NetworkSettings"]["Networks"] = {oc.AMN_NET: {}, "amnezia-dns-net": {}}
+    return item
+
+
+class Amnezia(unittest.TestCase):
+    def test_guard_is_postrouting_by_source_without_mark(self):
+        rules = oc.amnezia_rules(amn_cfg())
+        post = [r for r in rules if r[2] == "OC_AMN_POST"]
+        self.assertEqual(post[-1][3][-2:], ["-j", "DROP"])
+        self.assertIn("172.31.250.0/24", post[-1][3])
+        self.assertNotIn("--mark", post[-1][3])
+        self.assertIn(("iptables", "mangle", "POSTROUTING", "OC_AMN_POST"), oc.HOOKS)
+
+    def test_mark_only_original_forwarded_traffic_from_managed_bridge(self):
+        mark = [r for r in oc.amnezia_rules(amn_cfg()) if r[2] == "OC_AMN_ROUTE"][-1][3]
+        self.assertEqual(mark[mark.index("-i") + 1], oc.AMN_BRIDGE)
+        self.assertEqual(mark[mark.index("--ctdir") + 1], "ORIGINAL")
+        self.assertEqual(mark[-1], oc.MARK)
+        self.assertIn(("iptables", "mangle", "PREROUTING", "OC_AMN_ROUTE"), oc.HOOKS)
+
+    def test_bridge_exclusions_precede_actions(self):
+        for chain in oc.AMN_CHAINS:
+            rules = [r[3] for r in oc.amnezia_rules(amn_cfg()) if r[2] == chain]
+            self.assertEqual([r[1] for r in rules[:-1]], ["172.29.172.0/24", "172.31.250.0/24"])
+            self.assertTrue(all(r[-1] == "RETURN" for r in rules[:-1]))
+        self.assertEqual(oc.amnezia_rules(cfg()), [])
+
+    def test_chain_refresh_is_one_restore_transaction(self):
+        with patch.object(oc, "run") as run:
+            oc.amnezia_chains(amn_cfg())
+        args, kwargs = run.call_args
+        self.assertEqual(args[0][:1], ["iptables-restore"])
+        self.assertIn("--noflush", args[0])
+        self.assertTrue(kwargs["input"].startswith("*mangle\n:OC_AMN_ROUTE - [0:0]\n:OC_AMN_POST - [0:0]\n"))
+        self.assertTrue(kwargs["input"].endswith("COMMIT\n"))
+
+    def test_all_guards_hooked_before_any_marking(self):
+        order = []
+        def ensure(tool, table, chain, rule, **kwargs):
+            if kwargs.get("insert"):
+                order.append(rule[-1])
+        with patch.object(oc.Path, "is_dir", return_value=True), patch.object(oc, "ensure_ip_rule"), \
+             patch.object(oc, "run", return_value=subprocess.CompletedProcess([], 0, "dev ocss0", "")), \
+             patch.object(oc, "ensure_rule", side_effect=ensure):
+            oc.attach(amn_cfg(True))
+        self.assertEqual(order[:3], ["OC_POST", "OC_V6", "OC_AMN_POST"])
+        self.assertEqual(sorted(order[3:]), ["OC_AMN_ROUTE", "OC_ROUTE"])
+
+    def test_payload_moves_to_managed_bridge_and_preserves_settings(self):
+        before = amn_original()
+        payload = oc.amnezia_payload(before)
+        self.assertEqual(payload["Env"], ["AWG=1"])
+        self.assertEqual(payload["Image"], "sha256:awg")
+        self.assertEqual(payload["HostConfig"]["PortBindings"], before["HostConfig"]["PortBindings"])
+        self.assertTrue(payload["HostConfig"]["Privileged"])
+        self.assertEqual(payload["HostConfig"]["NetworkMode"], oc.AMN_NET)
+        self.assertEqual(payload["HostConfig"]["RestartPolicy"]["Name"], "no")
+        self.assertIn(oc.AMN_NET, payload["NetworkingConfig"]["EndpointsConfig"])
+        self.assertTrue(oc.amnezia_managed(amn_managed()))
+        self.assertFalse(oc.amnezia_managed(before))
+
+    def test_extra_networks_keep_static_ip_and_drop_generated_alias(self):
+        networks = oc.extra_networks(amn_original(), ())
+        self.assertEqual(networks, [("amnezia-dns-net", {"IPAMConfig": {"IPv4Address": "172.29.172.2"},
+                                                         "Aliases": ["awg"]})])
+
+    def test_restore_payload_uses_original_primary_network(self):
+        before = amn_original()
+        before["HostConfig"]["NetworkMode"] = "amnezia-dns-net"
+        payload = oc.original_payload(before)
+        self.assertEqual(payload["HostConfig"]["NetworkMode"], "amnezia-dns-net")
+        self.assertEqual(payload["NetworkingConfig"]["EndpointsConfig"]["amnezia-dns-net"]["IPAMConfig"],
+                         {"IPv4Address": "172.29.172.2"})
+        self.assertNotIn("NetworkingConfig", oc.original_payload(original()))  # Outline: host networking
+
+    def test_networks_connected_before_start(self):
+        events = []
+        def api(method, path, data=None, **kw):
+            events.append(path)
+            return {"Id": "new-container"} if path.startswith("/containers/create") else None
+        with patch.object(oc, "api", side_effect=api), patch.object(oc, "save"), \
+             patch.object(oc, "stop_container"), patch.object(oc, "start_container", side_effect=lambda *a: events.append("start")), \
+             patch.object(oc, "inspect", return_value={"State": {"Running": True}}):
+            oc.replace_container(amn_cfg(), amn_original(), {}, name="amnezia-awg",
+                                 networks=[("amnezia-dns-net", {})], ready=lambda _: True)
+        self.assertLess(events.index("/networks/amnezia-dns-net/connect"), events.index("start"))
+        self.assertIn("/containers/create?name=amnezia-awg", events)
+
+    def test_default_route_outside_managed_bridge_is_refused(self):
+        routes = json.dumps([{"dst": "default", "gateway": "172.29.172.1", "dev": "eth1"}])
+        with patch.object(oc, "run", return_value=subprocess.CompletedProcess([], 0, routes, "")) as run:
+            with self.assertRaises(oc.Error):
+                oc.check_gateway(amn_cfg(), "amnezia-awg", amn_original())
+        self.assertEqual(run.call_args.args[0][:4], ["nsenter", "-t", "4242", "-n"])
+
+    def test_egress_test_runs_in_container_namespace(self):
+        commands = []
+        def run(args, **kwargs):
+            commands.append(args)
+            if "route" in args:
+                return subprocess.CompletedProcess(args, 0, json.dumps([{"gateway": "172.31.250.1"}]), "")
+            if args[4] == "curl":
+                return subprocess.CompletedProcess(args, 0, "ip=203.0.113.10\n", "")
+            return subprocess.CompletedProcess(args, 0, "", "")  # no DNS answer
+        with patch.object(oc, "inspect", return_value=amn_managed()), patch.object(oc, "run", side_effect=run):
+            with self.assertRaises(oc.Error) as raised:
+                oc.test_amnezia(amn_cfg(True), "amnezia-awg", "203.0.113.10")
+        self.assertIn("UDP DNS", str(raised.exception))
+        self.assertTrue(all(c[:4] == ["nsenter", "-t", "4242", "-n"] for c in commands))
+
+    def test_supervisor_stops_unmanaged_container_only_while_on(self):
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled), patch.object(oc, "inspect", return_value=amn_original()), \
+                 patch.object(oc, "stop_container") as stop, patch.object(oc, "start_container") as start, \
+                 patch("sys.stderr"):
+                oc.supervise_amnezia(amn_cfg(enabled), {})
+            self.assertEqual(stop.called, enabled)
+            start.assert_not_called()
+
+    def test_supervisor_ignores_uncommitted_and_starts_managed(self):
+        stopped = amn_managed()
+        stopped["State"]["Running"] = False
+        with patch.object(oc, "inspect", side_effect=[stopped, amn_managed()]), \
+             patch.object(oc, "start_container") as start, patch.object(oc, "check_gateway"):
+            oc.supervise_amnezia(amn_cfg(True), {})
+        start.assert_called_once_with("amnezia-awg")
+        with patch.object(oc, "inspect") as inspect:
+            self.assertEqual(oc.supervise_amnezia(amn_cfg(True, ready=False), {}), {})
+        inspect.assert_not_called()
+
+    def test_failed_add_forgets_container(self):
+        state = cfg(False)
+        state["amnezia"] = {"subnet": "172.31.250.0/24", "gateway": "172.31.250.1", "containers": {}}
+        class Args:
+            name = "amnezia-awg"
+            subnet = oc.AMN_SUBNET
+        with patch.object(oc, "inspect", return_value=amn_original()), patch.object(oc, "preflight_amnezia", return_value=[]), \
+             patch.object(oc, "atomic"), patch.object(oc, "save"), \
+             patch.object(oc, "replace_container", side_effect=oc.Error("create failed")):
+            with self.assertRaises(oc.Error):
+                oc.amnezia_add(state, Args())
+        self.assertEqual(state["amnezia"]["containers"], {})
+
+    def test_recover_settles_registration(self):
+        for kind, committed, expected in [("amnezia-add", True, True), ("amnezia-add", False, None),
+                                          ("amnezia-remove", True, None), ("amnezia-remove", False, True)]:
+            with self.subTest(kind=kind, committed=committed):
+                state = amn_cfg(ready=False)
+                oc.settle_amnezia(state, "amnezia-awg", kind, committed=committed)
+                entry = state["amnezia"]["containers"].get("amnezia-awg")
+                self.assertEqual(entry and entry["ready"], expected)
+
+
 class Keys(unittest.TestCase):
     def encoded(self, text):
         return base64.urlsafe_b64encode(text.encode()).decode().rstrip("=")
@@ -256,9 +433,11 @@ class FilesAndUnits(unittest.TestCase):
              patch.object(oc, "notify_ready", side_effect=action("ready")), \
              patch.object(oc, "stop_container", side_effect=action("stop")), \
              patch.object(oc, "detach", side_effect=action("detach")), \
-             patch.object(oc, "stop_tunnel", side_effect=action("stop_tunnel")):
+             patch.object(oc, "stop_tunnel", side_effect=action("stop_tunnel")), \
+             patch.object(oc, "supervise_amnezia", side_effect=lambda *a: events.append("amnezia") or {}):
             oc.serve()
         self.assertLess(events.index("guard"), events.index("start"))
+        self.assertLess(events.index("guard"), events.index("amnezia"))
         self.assertLess(events.index("stop"), events.index("detach"))
         self.assertLess(events.index("detach"), events.index("stop_tunnel"))
 
