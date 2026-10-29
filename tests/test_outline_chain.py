@@ -162,6 +162,23 @@ class Amnezia(unittest.TestCase):
         self.assertIn("container=fedcba9876543210", paths[commit])
         self.assertEqual(calls[create][2]["Image"], "sha256:snapshot")
         self.assertFalse(any(m == "DELETE" for m, *_ in calls))  # the old container stays as a backup
+        self.assertEqual(calls[commit][2], {"Labels": {}})  # managed labels are not baked into the image
+
+    def test_leftover_label_without_managed_network_can_be_added(self):
+        class Args:
+            name = "amnezia-awg"
+            subnet = oc.AMN_SUBNET
+        item = amn_original()
+        item["Config"]["Labels"] = {oc.LABEL: "1"}  # inherited from a restore snapshot
+        state = amn_cfg()
+        state["amnezia"]["containers"] = {}
+        with patch.object(oc, "inspect", return_value=item), patch.object(oc, "preflight_amnezia", return_value=[]), \
+             patch.object(oc, "atomic"), patch.object(oc, "save"), patch.object(oc, "replace_container") as replace, \
+             patch("sys.stdout"):
+            oc.amnezia_add(state, Args())
+        replace.assert_called_once()
+        with patch.object(oc, "inspect", return_value=amn_managed()), self.assertRaises(oc.Error):
+            oc.amnezia_add(amn_cfg(), Args())
 
     def test_add_and_remove_both_snapshot(self):
         class Args:

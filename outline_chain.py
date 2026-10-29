@@ -287,7 +287,10 @@ def replace_container(cfg, original, payload, *, name=None, networks=(), ready=o
         if snapshot:
             query = urllib.parse.urlencode({"container": old_id, "repo": "outline-chain/" + name.lower(),
                                             "tag": time.strftime("%Y%m%d-%H%M%S"), "pause": "false"})
-            payload = dict(payload, Image=api("POST", "/commit?" + query, {})["Id"])
+            # A commit copies the old container's labels into the image, and containers inherit image
+            # labels; set them to the replacement's, so a restored container is not marked managed.
+            image = api("POST", "/commit?" + query, {"Labels": payload.get("Labels") or {}})["Id"]
+            payload = dict(payload, Image=image)
         api("POST", cpath(old_id, "/rename?name=" + backup_name))
         renamed = True
         created = api("POST", "/containers/create?name=" + urllib.parse.quote(name), payload)
@@ -747,7 +750,8 @@ def amnezia_add(cfg, args):
         found = [row["Names"][0].lstrip("/") for row in api("GET", "/containers/json?all=true")
                  if "amnezia" in (row["Names"][0] + row["Image"]).lower()]
         raise Error(f"No container named {name}. Amnezia containers here: {', '.join(found) or 'none'}.") from None
-    if (original["Config"].get("Labels") or {}).get(LABEL) == "1":
+    # Judge by the actual settings: a label alone may be left over from an earlier snapshot.
+    if amnezia_managed(original):
         raise Error(f"{name} is already managed.")
     exclude = preflight_amnezia(original)
     section = cfg.setdefault("amnezia", {"subnet": None, "gateway": None, "containers": {}})
